@@ -86,6 +86,20 @@ DOUBAO_RESOURCES = [
 ]
 DOUBAO_RESOURCE_VALUES = {r["value"] for r in DOUBAO_RESOURCES}
 
+# ---------- 视觉模型：VLLM ----------
+VLLM_PROVIDERS = [
+    {"id": "zhipu", "label": "智谱 GLM-4V", "entry": "ChatGLMVLLM",
+     "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+     "model": "glm-4v-flash",
+     "hint": "免费额度足够，支持图片输入"},
+    {"id": "qwen", "label": "通义千问 Qwen-VL", "entry": "QwenVLVLLM",
+     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+     "model": "qwen3.5-flash",
+     "hint": "阿里云的视觉模型"},
+]
+VLLM_PROVIDER_BY_ID = {v["id"]: v for v in VLLM_PROVIDERS}
+VLLM_PROVIDER_BY_ENTRY = {v["entry"]: v for v in VLLM_PROVIDERS}
+
 # ---------- 语音合成：EdgeTTS 中文音色 ----------
 EDGE_VOICES = [
     {"value": "zh-CN-XiaoxiaoNeural", "name": "晓晓", "gender": "女", "style": "温暖", "group": "普通话"},

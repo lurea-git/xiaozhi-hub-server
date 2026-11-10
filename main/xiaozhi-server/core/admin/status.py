@@ -75,7 +75,7 @@ def collect_status(config: dict, merged: dict) -> dict:
     # 所选模块需要的 Python 包：同步上游后默认模块新增了依赖、或手动改配置选了其他模块时，
     # 精简安装可能缺包。后台不管理的 VAD、Memory、VLLM 也要查，否则服务会在启动时才报错
     lacking = []
-    for section in (*config_store.SECTIONS, "VAD", "Memory", "VLLM"):
+    for section in ("LLM", "ASR", "TTS", "Intent", "VAD", "Memory", "VLLM"):
         name = selected.get(section)
         missing = deps.missing_packages(section, config_store.entry_type(merged, section)) if name else ()
         if missing:
@@ -133,6 +133,6 @@ def collect_status(config: dict, merged: dict) -> dict:
             "admin": f"http://{ip}:{http_port}/admin",
         },
         "modules": {k: {"selected": selected.get(k), "type": config_store.entry_type(merged, k),
-                        "running": running.get(k)} for k in config_store.SECTIONS},
+                        "running": running.get(k)} for k in ("LLM", "ASR", "TTS", "Intent")},
         "checks": checks,
     }

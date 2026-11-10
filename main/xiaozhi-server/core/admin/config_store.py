@@ -22,7 +22,7 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
 from config.config_loader import get_project_dir, merge_configs, read_config
 
-SECTIONS = ("LLM", "ASR", "TTS", "Intent")
+SECTIONS = ("LLM", "ASR", "TTS", "Intent", "VLLM")
 SECRET_FIELD = re.compile(
     r"(^token$|_token$|api_?key|access_?token|access_?key|secret|password|passwd|private_?key|app_?key"
     r"|authorization|bearer|cookie|credential)",

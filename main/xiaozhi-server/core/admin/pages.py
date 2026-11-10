@@ -730,6 +730,94 @@ def save_tts_voice(voice: str, merged: dict, path: Path = None) -> list:
     return config_store.update_entry("TTS", name, {"voice": voice}, merged, path)
 
 
+
+
+# ---------- 视觉模型 ----------
+
+def describe_vllm(merged: dict) -> dict:
+    """视觉模型（VLLM）页面数据：当前模型、支持的厂商列表、各厂商配置状态。"""
+    name = _selected(merged, "VLLM")
+    providers = []
+    for prov in catalog.VLLM_PROVIDERS:
+        entry = _entry(merged, "VLLM", prov["entry"])
+        key = entry.get("api_key")
+        base_url = _text(entry.get(_url_field(entry))) or prov["base_url"]
+        model = _text(entry.get("model_name")) or prov["model"]
+        key_set = not config_store.is_placeholder(key)
+        exists = bool(entry) and entry.get("type") == "openai"
+        providers.append({
+            "id": prov["id"],
+            "label": prov["label"],
+            "entry": prov["entry"],
+            "base_url": base_url,
+            "model": model,
+            "hint": prov.get("hint", ""),
+            "key_set": key_set,
+            "key_hint": config_store.mask_key(key),
+            "configured": exists and bool(base_url and model and key_set),
+            "conflict": bool(entry) and entry.get("type") != "openai",
+        })
+    current = next((p for p in providers if p["entry"] == name), None)
+    return {
+        "selected": name,
+        "providers": providers,
+        "current": current,
+        "using": name if current and current["configured"] else None,
+    }
+
+
+def save_vllm_provider(provider_id: str, payload: dict, merged: dict, path: Path = None) -> list:
+    """保存视觉模型厂商的接口地址、模型和 API Key。"""
+    prov = catalog.VLLM_PROVIDER_BY_ID.get(provider_id)
+    if not prov:
+        raise KeyError(provider_id)
+    entry = _entry(merged, "VLLM", prov["entry"])
+    url_field = _url_field(entry) if entry else "base_url"
+    fields = {
+        url_field: (payload.get("base_url") or "").strip(),
+        "model_name": (payload.get("model") or "").strip(),
+    }
+    if "api_key" in payload and payload["api_key"]:
+        fields["api_key"] = str(payload["api_key"]).strip()
+    # 校验
+    if fields[url_field] and not URL.match(fields[url_field]):
+        raise ValueError("接口地址需要是 http:// 或 https:// 开头的完整 URL")
+    if not fields["model_name"]:
+        raise ValueError("模型名不能为空")
+    if fields[url_field]:
+        fields[url_field] = fields[url_field].rstrip("/")
+    else:
+        del fields[url_field]  # 地址留空表示不修改
+    return config_store.update_entry("VLLM", prov["entry"], fields, merged, path)
+
+
+def vllm_test_config(provider_id: str, payload: dict, merged: dict) -> dict:
+    """从提交的表单和已保存的配置拼出完整的测试配置（未保存的字段优先用提交的值）。"""
+    prov = catalog.VLLM_PROVIDER_BY_ID.get(provider_id)
+    if not prov:
+        raise KeyError(provider_id)
+    entry = _entry(merged, "VLLM", prov["entry"])
+    url_field = _url_field(entry) if entry else "base_url"
+    base_url = (payload.get("base_url") or "").strip() or entry.get(url_field) or prov["base_url"]
+    model = (payload.get("model") or "").strip() or entry.get("model_name") or prov["model"]
+    api_key = str(payload.get("api_key") or "").strip()
+    if not api_key:
+        api_key = entry.get("api_key", "")
+    if config_store.is_placeholder(api_key):
+        raise ValueError("请先填写 API Key")
+    if not URL.match(base_url):
+        raise ValueError("接口地址格式不对")
+    if not model.strip():
+        raise ValueError("模型名不能为空")
+    return {
+        "type": "openai",
+        "base_url": base_url.rstrip("/"),
+        "model_name": model,
+        "api_key": api_key,
+        "timeout": 20,
+    }
+
+
 # ---------- 意图识别 ----------
 
 def plugin_configured(merged: dict, plugin: dict) -> bool:

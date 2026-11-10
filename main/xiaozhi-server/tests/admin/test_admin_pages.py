@@ -959,3 +959,56 @@ async def test_kiosk_tts(kiosk, monkeypatch):
     assert (await kiosk.post("/kiosk/tts", json={"text": "该晾衣服了"})).status == 502
     FakeTTS.interface_type = InterfaceType.DUAL_STREAM   # 流式合成
     assert (await kiosk.post("/kiosk/tts", json={"text": "该晾衣服了"})).status == 501
+
+
+# ---------- 视觉模型 ----------
+
+def test_describe_vllm_default_and_unconfigured(cfg_path):
+    d = pages.describe_vllm(merged(cfg_path))
+    assert [p["id"] for p in d["providers"]] == ["zhipu", "qwen"]
+    zhipu = d["providers"][0]
+    assert zhipu["model"] == "glm-4v-flash" and zhipu["base_url"].startswith("https://open.bigmodel.cn")
+    assert zhipu["configured"] is False and zhipu["key_hint"] == ""  # 占位 Key 不算配置好
+    assert d["using"] is None
+
+
+def test_save_vllm_provider_masks_key_and_keeps_empty_key(cfg_path):
+    changed = pages.save_vllm_provider("zhipu", {"base_url": "https://open.bigmodel.cn/api/paas/v4/",
+                                                 "model": "glm-4v-plus", "api_key": "abcd1234.efgh5678ijkl"},
+                                       merged(cfg_path), cfg_path)
+    assert "api_key" in changed and "model_name" in changed
+    d = pages.describe_vllm(merged(cfg_path))
+    zhipu = d["providers"][0]
+    assert zhipu["configured"] and zhipu["model"] == "glm-4v-plus"
+    assert "abcd1234.efgh5678ijkl" not in str(d) and zhipu["key_hint"] == "abcd…ijkl"
+    assert d["using"] == "ChatGLMVLLM"
+    # Key 留空：不修改
+    assert pages.save_vllm_provider("zhipu", {"model": "glm-4v-plus", "api_key": ""}, merged(cfg_path), cfg_path) == []
+    assert merged(cfg_path)["VLLM"]["ChatGLMVLLM"]["api_key"] == "abcd1234.efgh5678ijkl"
+
+
+@pytest.mark.parametrize("payload,message", [
+    ({"base_url": "ftp://x", "model": "m"}, "接口地址"),
+    ({"base_url": "https://x.com/v1", "model": " "}, "模型名"),
+])
+def test_save_vllm_provider_validation(cfg_path, payload, message):
+    with pytest.raises(ValueError, match=message):
+        pages.save_vllm_provider("zhipu", payload, merged(cfg_path), cfg_path)
+    with pytest.raises(KeyError):
+        pages.save_vllm_provider("nope", {"model": "m"}, merged(cfg_path), cfg_path)
+
+
+def test_vllm_test_config_needs_key_and_prefers_form(cfg_path):
+    with pytest.raises(ValueError, match="API Key"):
+        pages.vllm_test_config("zhipu", {}, merged(cfg_path))
+    cfg = pages.vllm_test_config("zhipu", {"api_key": "k-123", "model": "glm-4v-plus"}, merged(cfg_path))
+    assert cfg["api_key"] == "k-123" and cfg["model_name"] == "glm-4v-plus" and cfg["type"] == "openai"
+
+
+async def test_vllm_endpoints(client, monkeypatch):
+    await client.post("/admin/api/setup", json={"password": "pass-1234"})
+    data = await (await client.get("/admin/api/vllm")).json()
+    assert data["ok"] and [p["id"] for p in data["providers"]] == ["zhipu", "qwen"]
+    # 没填 Key 不能切换
+    r = await (await client.post("/admin/api/vllm/use", json={"provider": "qwen"})).json()
+    assert not r["ok"]

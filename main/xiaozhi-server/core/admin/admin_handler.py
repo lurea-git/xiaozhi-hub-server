@@ -123,6 +123,10 @@ class AdminHandler:
                 web.get("/admin/api/tts", self.handle_tts),
                 web.post("/admin/api/tts", self.handle_tts_save),
                 web.get("/admin/api/tts/preview", self.handle_tts_preview),
+                web.get("/admin/api/vllm", self.handle_vllm),
+                web.post("/admin/api/vllm/providers/{provider}", self.handle_vllm_provider),
+                web.post("/admin/api/vllm/providers/{provider}/test", self.handle_vllm_provider_test),
+                web.post("/admin/api/vllm/use", self.handle_vllm_use),
                 web.get("/admin/api/intent", self.handle_intent),
                 web.post("/admin/api/intent", self.handle_intent_save),
                 web.get("/admin/api/plugin-settings/{id}", self.handle_plugin_settings),
@@ -302,8 +306,11 @@ class AdminHandler:
             self.config[section] = new_section
             self.config.setdefault("selected_module", {})[section] = new_selected
 
-        if section == "TTS" or self.ws_server is None:
+        if section in ("TTS", "VLLM") or self.ws_server is None:
             commit()
+            if section == "VLLM":
+                # 识图接口每次请求都按当前配置创建视觉模型，不用重建实例
+                return {"applied": True, "note": "已保存，马上生效"}
             if section == "TTS":
                 return {"applied": True, "note": "已保存，设备重新连接后生效"}
             return {"applied": False, "note": "已保存，重启服务后生效"}
@@ -1025,6 +1032,108 @@ class AdminHandler:
             self._voice_samples[voice] = audio
         return web.Response(body=audio, content_type="audio/mpeg",
                             headers={**SECURITY_HEADERS, "Cache-Control": "private, max-age=86400"})
+
+    # ---------- 视觉模型 ----------
+
+    async def handle_vllm(self, request: web.Request):
+        self._require_login(request)
+        merged = await self._blocking(self._merged)
+        return self._json({"ok": True, **pages.describe_vllm(merged), "running": self._running("VLLM")})
+
+    async def handle_vllm_provider(self, request: web.Request):
+        self._require_login(request)
+        provider = request.match_info["provider"]
+        body = await self._read_json(request)
+        try:
+            merged = await self._blocking(self._merged)
+            changed = await self._blocking(pages.save_vllm_provider, provider, body, merged, self.config_path)
+        except KeyError:
+            return self._error("不支持这个视觉模型厂商", 404)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        prov = catalog.VLLM_PROVIDER_BY_ID[provider]
+        applied = await self._apply_if_selected("VLLM", prov["entry"], changed)
+        self.logger.bind(tag=TAG).info(f"管理后台更新了视觉模型 {provider} 的 API 设置: {', '.join(changed) or '无变化'}")
+        return self._json({"ok": True, "changed": changed, **applied})
+
+    async def handle_vllm_provider_test(self, request: web.Request):
+        self._require_login(request)
+        provider = request.match_info["provider"]
+        body = await self._read_json(request)
+        try:
+            merged = await self._blocking(self._merged)
+            config = pages.vllm_test_config(provider, body, merged)
+        except KeyError:
+            return self._error("不支持这个视觉模型厂商", 404)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        result = await self._blocking(self._test_vllm, config)
+        return self._json(result) if result["ok"] else self._error(result["error"], 400)
+
+    @staticmethod
+    def _test_vllm(config: dict) -> dict:
+        """测试视觉模型接口：发一张简单图片（1x1 白色 PNG）问"图里有什么颜色"。"""
+        import base64
+        import httpx
+        import openai
+
+        # 1x1 白色 PNG（最小有效图片）
+        test_image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+
+        started = time.time()
+        try:
+            client = openai.OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+            client.max_retries = 0
+            response = client.chat.completions.create(
+                model=config["model_name"],
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "这张图片是什么颜色？用一个字回答"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{test_image_b64}"}}
+                    ]
+                }],
+                max_tokens=50,
+                timeout=config.get("timeout", 20)
+            )
+            reply = response.choices[0].message.content.strip()[:60]
+            return {"ok": True, "seconds": round(time.time() - started, 1), "reply": reply}
+        except openai.AuthenticationError:
+            return {"ok": False, "error": "API Key 不对或已失效"}
+        except openai.NotFoundError:
+            return {"ok": False, "error": "找不到这个模型或接口地址，请检查模型名称和接口地址"}
+        except openai.RateLimitError:
+            return {"ok": False, "error": "请求太频繁或额度用完了"}
+        except (openai.APIConnectionError, httpx.TransportError) as e:
+            if isinstance(e, httpx.ReadTimeout) or isinstance(e.__cause__, httpx.ReadTimeout):
+                return {"ok": False, "error": f"接口连上了，但模型 {config.get('timeout', 20):.0f} 秒都没有回应"}
+            return {"ok": False, "error": "连不上接口地址，请检查地址和网络"}
+        except openai.APIStatusError as e:
+            return {"ok": False, "error": f"接口返回错误 {e.status_code}：{str(e.message)[:200]}"}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+
+    async def handle_vllm_use(self, request: web.Request):
+        """切换默认视觉模型到指定厂商。"""
+        self._require_login(request)
+        body = await self._read_json(request)
+        provider_id = str(body.get("provider") or "")
+        prov = catalog.VLLM_PROVIDER_BY_ID.get(provider_id)
+        if prov is None:
+            return self._error("不支持这个视觉模型厂商", 404)
+        merged = await self._blocking(self._merged)
+        desc = pages.describe_vllm(merged)
+        provider_info = next((p for p in desc["providers"] if p["id"] == provider_id), None)
+        if not provider_info or not provider_info["configured"]:
+            return self._error(f"{prov['label']} 还没配置好，请先填写接口地址、模型和 API Key 并保存", 400)
+        try:
+            result = await self._switch("VLLM", prov["entry"])
+        except KeyError:
+            return self._error(f"配置里没有 {prov['entry']}", 404)
+        if not result["ok"]:
+            return self._error(result["note"], 400)
+        self.logger.bind(tag=TAG).info(f"管理后台切换视觉模型为: {prov['entry']}")
+        return self._json(result)
 
     # ---------- 意图识别 ----------
 
