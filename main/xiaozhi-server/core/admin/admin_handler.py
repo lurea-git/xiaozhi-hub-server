@@ -31,6 +31,8 @@ from core.agent import chat_history, llm_router, reports
 from core.agent.agent_session import ErrorKind
 from core.agent.grokbot_client import GrokBotError
 from core.utils.modules_initialize import initialize_modules
+from core.utils import photo_box
+from core.utils.vllm import create_instance as create_vllm
 from core.utils.textUtils import EMOJI_MAP
 
 TAG = __name__
@@ -146,6 +148,8 @@ class AdminHandler:
                 web.post("/kiosk/llm/use", self.handle_kiosk_llm_use),
                 web.post("/kiosk/reports", self.handle_kiosk_reports),
                 web.post("/kiosk/asr", self.handle_kiosk_asr),
+                web.post("/kiosk/photo", self.handle_kiosk_photo),
+                web.delete("/kiosk/photo", self.handle_kiosk_photo_discard),
                 web.post("/kiosk/tts", self.handle_kiosk_tts),
                 web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
                 web.post("/kiosk/chat/clear", self.handle_kiosk_chat_clear),
@@ -786,6 +790,38 @@ class AdminHandler:
         started = time.monotonic()
         text = await self._blocking(asr.recognize_pcm, pcm)
         return self._json({"ok": True, "text": text, "ms": round((time.monotonic() - started) * 1000)})
+
+    async def handle_kiosk_photo(self, request: web.Request):
+        """设备拍了一张照片：body 是 JPEG，?device=<device-id>。暂存起来，用户的下一句话就是在问这张照片。
+
+        视觉模型没配好（没选、没填 Key）当场报错，不用等用户问完才发现。"""
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        device = (request.query.get("device") or "").strip()
+        if not device:
+            return self._error("缺少 device", 400)
+        jpeg = await request.read()
+        if len(jpeg) < 4 or len(jpeg) > photo_box.MAX_BYTES:
+            return self._error(f"照片要在 {photo_box.MAX_BYTES // 1024} KB 以内", 400)
+        if not jpeg.startswith(b"\xff\xd8\xff"):
+            return self._error("需要 JPEG 照片", 400)
+        merged = await self._blocking(self._merged)
+        current = pages.describe_vllm(merged)["current"]
+        if not current or not current["configured"]:
+            return self._error("还没配置视觉模型，请先在管理后台的“视觉模型”页填好 API Key", 409)
+        try:
+            vllm = await self._blocking(create_vllm, "openai", merged["VLLM"][current["entry"]])
+        except Exception as e:  # noqa: BLE001
+            return self._error(f"视觉模型不能用：{e}", 409)
+        photo_box.put(device, jpeg, vllm, current["label"])
+        self.logger.bind(tag=TAG).info(f"收到设备 {device} 的照片 {len(jpeg) // 1024} KB，使用 {current['label']}")
+        return self._json({"ok": True, "model": current["label"], "ttl": photo_box.TTL_SECONDS})
+
+    async def handle_kiosk_photo_discard(self, request: web.Request):
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        device = (request.query.get("device") or "").strip()
+        return self._json({"ok": True, "discarded": photo_box.clear(device)})
 
     async def handle_kiosk_tts(self, request: web.Request):
         """{"text"}：只合成、不对话，返回 16 位单声道 WAV（24 kHz）。

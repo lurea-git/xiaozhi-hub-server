@@ -12,7 +12,8 @@ from core.agent.call_names import handle_call_name
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent, speak_txt
 from core.utils.output_counter import check_device_output_limit
-from core.utils import turn_gen
+from core.utils import turn_gen, photo_box
+from core.agent import reports
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
 
 TAG = __name__
@@ -129,6 +130,14 @@ async def startToChat(conn: "ConnectionHandler", text, gen=None):
 
     if turn_gen.stale(conn, gen):
         conn.logger.bind(tag=TAG).info(f"开始回答前被打断，不再回答: {actual_text}")
+        return
+
+    # [xiaozhi-hub] 设备刚拍了照：这句话是在问这张照片，交给视觉模型（每张照片只回答一次）
+    photo = photo_box.take(reports.device_key(conn))
+    if photo is not None:
+        await send_stt_message(conn, actual_text)
+        conn.client_abort = False
+        conn.executor.submit(photo_box.ask, conn, actual_text, photo, gen)
         return
 
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
