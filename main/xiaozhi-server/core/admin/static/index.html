@@ -314,6 +314,7 @@
       <button data-page="llm"><span class="ico">✦</span>大模型</button>
       <button data-page="calls"><span class="ico">☎</span>呼名</button>
       <button data-page="grokbot"><span class="ico">☁</span>Grok Bot</button>
+      <button data-page="vllm"><span class="ico">◉</span>视觉模型</button>
       <button data-page="memory"><span class="ico">✎</span>记忆</button>
       <button data-page="asr"><span class="ico">◐</span>语音识别</button>
       <button data-page="tts"><span class="ico">♪</span>语音合成</button>
@@ -426,7 +427,7 @@ $("auth-form").addEventListener("submit", async (ev) => {
 });
 $("logout").onclick = async () => { if (!confirmLeave()) return; page.dirty = null; await api("logout", {}); await route(); };
 
-const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent, update: renderUpdate };
+const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, vllm: renderVLLM, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent, update: renderUpdate };
 const page = { name: "", dirty: null, timer: null };
 function currentPage() { const p = location.hash.slice(1); return PAGES[p] ? p : "status"; }
 function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当前页面有修改还没保存，确定离开吗？"); }
@@ -852,6 +853,77 @@ async function renderLLM(root) {
   }));
   renderApi();
   page.dirty = () => cliDirty() || apiDirty();
+}
+
+// ---------- 视觉模型 ----------
+
+let vllmProvider = null;
+async function renderVLLM(root) {
+  const d = await api("vllm");
+  if (!vllmProvider || !d.providers.find((x) => x.id === vllmProvider)) {
+    vllmProvider = (d.current || d.providers.find((x) => x.configured) || d.providers[0]).id;
+  }
+  const cur = d.current && d.current.configured ? `${d.current.label} · ${d.current.model}` : "未配置";
+  root.innerHTML = `
+    <div class="page-head"><div><h1>视觉模型</h1><p class="sub">设备拍照后“这是什么”的识图功能用它回答。需要支持图片输入的模型；Key 填好后保存即可，不用重启。</p></div>
+      <span class="pill ${d.using ? "ok" : "warn"}">当前：${esc(cur)}</span></div>
+    ${d.selected && !d.current ? `<div class="banner warn">当前选的 ${esc(d.selected)} 不在后台管理范围内（可能是手动改了配置文件）。在下面选一个并点"保存并设为当前"即可切换。</div>` : ""}
+    <div class="choices">
+      ${d.providers.map((x) => `<button class="choice ${x.id === vllmProvider ? "on" : ""}" data-prov="${x.id}">
+        <div class="mark" style="background:var(--accent-soft);color:var(--accent)">${esc(x.label.slice(0, 1))}</div>
+        <div><b>${esc(x.label)}</b> ${x.entry === d.selected ? '<span class="pill ok">使用中</span>' : x.configured ? '<span class="pill">已配置</span>' : '<span class="pill">未配置</span>'}
+          <small>${esc(x.hint)}</small></div></button>`).join("")}
+    </div>
+    <div class="card panel" id="vllm-form"></div>`;
+  let dirty = () => false;
+  const render = () => {
+    const x = d.providers.find((y) => y.id === vllmProvider), using = x.entry === d.selected;
+    const box = $("vllm-form");
+    box.innerHTML = `
+      ${x.conflict ? `<div class="banner err">配置里已有一个叫 ${esc(x.entry)} 的条目，但不是 OpenAI 兼容类型，请在配置文件里改名或删掉它。</div>` : ""}
+      <div class="grid2">
+        <label class="f">接口地址<input class="in mono" id="vl-url" value="${esc(x.base_url)}" placeholder="https://…/v1"></label>
+        <label class="f">模型<input class="in mono" id="vl-model" value="${esc(x.model)}" placeholder="模型名称"></label>
+        <label class="f full">API Key
+          <input class="in mono" id="vl-key" type="password" autocomplete="off"
+            placeholder="${x.key_set ? `已设置 ${esc(x.key_hint)}，输入新值可替换` : "未设置，粘贴后保存"}"></label>
+      </div>
+      <p class="muted small" style="margin:8px 0 0">Key 只保存在这台设备的配置文件里，页面上只显示首尾 4 位。</p>
+      <div class="actions"><span class="result" id="vl-result"></span>
+        <button class="btn" id="vl-test">测试连接</button>
+        <button class="btn ${using ? "primary" : ""}" id="vl-save">保存</button>
+        ${using ? "" : '<button class="btn primary" id="vl-use">保存并设为当前</button>'}</div>`;
+    const values = () => ({ base_url: $("vl-url").value.trim(), model: $("vl-model").value.trim(), api_key: $("vl-key").value.trim() });
+    dirty = snapshot(values);
+    const result = (html) => ($("vl-result").innerHTML = html);
+    const bad = (msg) => result(`<span style="color:var(--err)">${esc(msg)}</span>`);
+    $("vl-test").onclick = (e) => busy(e.target, async () => {
+      result('<span class="muted">正在发一张测试图片（最多等 30 秒）…</span>');
+      try {
+        const r = await api(`vllm/providers/${x.id}/test`, values());
+        result(`<span style="color:var(--ok)">✓ 连接正常，${r.seconds < 1 ? "不到 1 秒" : r.seconds + " 秒"}收到回复“${esc(r.reply)}”</span>`);
+      } catch (err) { bad(err.message); }
+    });
+    $("vl-save").onclick = (e) => busy(e.target, async () => {
+      try { const r = await api(`vllm/providers/${x.id}`, values()); toast(r.changed.length ? r.note : "没有修改"); page.dirty = null; await openPage("vllm", true); }
+      catch (err) { bad(err.message); }
+    });
+    if ($("vl-use")) $("vl-use").onclick = (e) => busy(e.target, async () => {
+      try {
+        await api(`vllm/providers/${x.id}`, values());
+        const r = await api("vllm/use", { provider: x.id });
+        toast(r.note); page.dirty = null; await openPage("vllm", true);
+      } catch (err) { bad(err.message); }
+    });
+  };
+  root.querySelectorAll("[data-prov]").forEach((b) => (b.onclick = () => {
+    if (dirty() && !confirm("这个厂商的修改还没保存，确定切换吗？")) return;
+    vllmProvider = b.dataset.prov;
+    root.querySelectorAll("[data-prov]").forEach((y) => y.classList.toggle("on", y === b));
+    render();
+  }));
+  render();
+  page.dirty = () => dirty();
 }
 
 // ---------- 语音识别 ----------
