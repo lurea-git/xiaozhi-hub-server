@@ -152,6 +152,7 @@ class AdminHandler:
                 web.delete("/kiosk/photo", self.handle_kiosk_photo_discard),
                 web.post("/kiosk/tts", self.handle_kiosk_tts),
                 web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
+                web.get("/kiosk/chat/image", self.handle_kiosk_chat_image),
                 web.post("/kiosk/chat/clear", self.handle_kiosk_chat_clear),
             ]
         )
@@ -873,6 +874,20 @@ class AdminHandler:
             return self._error("limit 要是数字", 400)
         models = await self._blocking(chat_history.history, device, limit)
         return self._json({"ok": True, "models": models})
+
+    async def handle_kiosk_chat_image(self, request: web.Request):
+        """?device=<device-id>&id=<消息 id>：这句提问附的照片（JPEG）。只认这台设备自己的记录。"""
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        device = (request.query.get("device") or "").strip()
+        try:
+            msg_id = int(request.query.get("id") or "")
+        except ValueError:
+            return self._error("id 要是数字", 400)
+        data = await self._blocking(chat_history.image_for, device, msg_id)
+        if data is None:
+            return self._error("没有这张照片", 404)
+        return web.Response(body=data, content_type="image/jpeg", headers={"Cache-Control": "max-age=3600"})
 
     async def handle_kiosk_chat_clear(self, request: web.Request):
         """{"device", "memory_only"?}：清除这台设备的聊天记录（所有模型），和语音"清除聊天记录"同一套。

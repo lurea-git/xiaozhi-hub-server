@@ -3,31 +3,30 @@
 流程：
 1. 设备客户端把照片 POST 到 /kiosk/photo，这里按设备暂存（put），同时建好视觉模型实例，
    没配好就当场报错，不用等用户问完才发现；
-2. 用户的下一句话进入 startToChat，发现这台设备有暂存照片（take），就不问对话模型，
-   改由 ask() 把"问题 + 照片"发给视觉模型，回答用语音念出来，并写进对话记录；
+2. 用户的下一句话进入 startToChat，发现这台设备有暂存照片（take），就由 ask() 先让视觉模型
+   只看图写一段客观描述，再把"问题 + 描述"交给对话模型（DeepSeek 等）回答：人设、上下文、
+   聊天记录都和普通提问一样；照片本身随这条提问存进聊天库；
 3. 超过 TTL 没人问，照片作废。
 """
 
-import re
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Optional
 
 from config.logger import setup_logging
-from core.utils import reply_progress, turn_gen
-from core.utils.dialogue import Message
+from core.utils import turn_gen
+from core.utils.dialogue import PHOTO_MARK
 
 TAG = __name__
 logger = setup_logging()
 
 TTL_SECONDS = 120
+DESCRIBE_PROMPT = (
+    "只客观描述这张图片里有什么：场景、物品、文字（原样抄写）、人物动作、数字和题目内容。"
+    "不要回答问题，不要评价，不要省略细节。"
+)
 MAX_BYTES = 900 * 1024  # aiohttp 默认请求体上限 1 MB
-PHOTO_MARK = "📷 "
-VOICE_HINT = "（回答会用语音播报：口语化、简洁，不要用列表、星号、井号和表格符号）"
-FAILED_REPLY = "识图没成功，请稍后再试"
-EXPIRED_REPLY = "这张照片已经过期了，请重新拍一张"
 
 
 @dataclass
@@ -71,48 +70,38 @@ def clear(key: str) -> bool:
         return _box.pop(key, None) is not None
 
 
-def split_sentences(text: str) -> list:
-    """按句拆开，合成可以边出边念。"""
-    parts = re.findall(r"[^。！？!?；;\n]+[。！？!?；;]?", text or "")
-    return [p.strip() for p in parts if p.strip()]
-
-
-def ask(conn, text: str, photo: Photo, gen: int) -> None:
-    """在线程里执行：把问题和照片发给视觉模型，回答念出来并写进对话。"""
+def describe(vllm, jpeg: bytes) -> str:
+    """视觉模型只做"眼睛"：给出图片描述，不回答问题（问题交给对话模型）。"""
     import base64
 
-    from core.agent import chat_history
-    from core.providers.tts.dto.dto import ContentType, SentenceType, TTSMessageDTO
+    return (vllm.response(DESCRIBE_PROMPT, base64.b64encode(jpeg).decode("ascii")) or "").strip()
 
-    sentence_id = uuid.uuid4().hex
-    turn_gen.bind(conn, sentence_id, gen)
-    conn.sentence_id = sentence_id
-    put_tts = conn.tts.tts_text_queue.put
 
-    def say(sentence_type, content_type, detail=None):
-        put_tts(TTSMessageDTO(sentence_id=sentence_id, sentence_type=sentence_type,
-                              content_type=content_type, content_detail=detail))
+def ask(conn, text: str, photo: "Photo", gen: int) -> None:
+    """在线程里执行：视觉模型看图写出描述，再把"问题 + 描述"交给这台设备的对话模型回答。
 
+    回答照常走对话模型（DeepSeek 等），所以人设、上下文、聊天记录都和普通提问一样。
+    """
+    import base64
+
+    conn.pending_photo = base64.b64encode(photo.jpeg).decode("ascii")
     try:
-        user_msg = Message(role="user", content=PHOTO_MARK + text)
-        conn.dialogue.put(user_msg)
-        reply_progress.note_turn(conn, sentence_id, user_msg)
-        say(SentenceType.FIRST, ContentType.ACTION)
+        described = ""
         try:
-            answer = photo.vllm.response(text + VOICE_HINT, base64.b64encode(photo.jpeg).decode("ascii"))
-            answer = (answer or "").strip() or FAILED_REPLY
-        except Exception as e:  # noqa: BLE001 —— 网络、Key、模型不支持图片等，一律给用户一句话
-            logger.bind(tag=TAG).error(f"视觉模型回答失败: {e!r}")
-            answer = FAILED_REPLY
-        if turn_gen.stale(conn, sentence_id=sentence_id):
-            logger.bind(tag=TAG).info("识图期间被打断，不再念")
+            described = describe(photo.vllm, photo.jpeg)
+        except Exception as e:  # noqa: BLE001 —— 视觉模型挂了就退化成只有文字问题
+            logger.bind(tag=TAG).error(f"视觉模型看图失败: {e!r}")
+        if turn_gen.stale(conn, gen):
+            logger.bind(tag=TAG).info("看图期间被打断，不再回答")
             return
-        logger.bind(tag=TAG).info(f"视觉模型回答: {answer[:80]}")
-        for sentence in split_sentences(answer) or [answer]:
-            say(SentenceType.MIDDLE, ContentType.TEXT, sentence)
-        say(SentenceType.LAST, ContentType.ACTION)
-        conn._put_reply(sentence_id, answer)
+        if described:
+            logger.bind(tag=TAG).info(f"图片描述: {described[:100]}")
+            query = f"{PHOTO_MARK}{text}\n\n（照片内容：{described}）"
+        else:
+            query = f"{PHOTO_MARK}{text}\n\n（用户刚拍了一张照片，但没能识别出内容）"
+        # 照片在 conn.pending_photo 里，chat() 把这条提问写进对话时由 chat_history.sync 一起存进库
+        conn.chat(query, turn=gen)
+    except Exception as e:  # noqa: BLE001
+        logger.bind(tag=TAG).error(f"看图回答失败: {e!r}")
     finally:
-        reply_progress.finish_turn(conn, sentence_id)
-        chat_history.sync(conn)
-        chat_history.maybe_summarize(conn)
+        conn.pending_photo = None

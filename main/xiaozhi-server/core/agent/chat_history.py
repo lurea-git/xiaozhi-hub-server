@@ -29,6 +29,7 @@ from typing import Dict, List, Optional
 
 from config.config_loader import get_project_dir
 from config.logger import setup_logging
+from core.utils.dialogue import PHOTO_MARK
 
 TAG = __name__
 logger = setup_logging()
@@ -110,7 +111,8 @@ class ChatDB:
                 content TEXT,
                 tool_calls TEXT,
                 tool_call_id TEXT,
-                created REAL NOT NULL
+                created REAL NOT NULL,
+                image TEXT
             );
             CREATE INDEX IF NOT EXISTS messages_device_model ON messages (device, model, id);
             CREATE TABLE IF NOT EXISTS device_memory (
@@ -129,7 +131,14 @@ class ChatDB:
             """
         )
         self._migrate()
+        self._add_image_column()
         self._private()
+
+    def _add_image_column(self) -> None:
+        """早期库里没有 image 列（拍照提问时附的照片，JPEG 的 base64）。"""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "image" not in cols:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN image TEXT")
 
     def _private(self) -> None:
         for suffix in ("", "-wal", "-shm"):
@@ -163,12 +172,29 @@ class ChatDB:
         with self._lock:
             return self._conn.execute(sql, args)
 
-    def insert(self, device, model, role, content, tool_calls=None, tool_call_id=None, created=None) -> int:
+    def insert(self, device, model, role, content, tool_calls=None, tool_call_id=None, created=None,
+               image=None) -> int:
         cur = self._exec(
-            "INSERT INTO messages (device, model, role, content, tool_calls, tool_call_id, created) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO messages (device, model, role, content, tool_calls, tool_call_id, created, image) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (device, model, role, content, json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None,
-             tool_call_id, created if created is not None else time.time()))
+             tool_call_id, created if created is not None else time.time(), image))
         return cur.lastrowid
+
+    def set_image(self, msg_id: int, image) -> None:
+        self._exec("UPDATE messages SET image=? WHERE id=?", (image, int(msg_id)))
+
+    def image(self, msg_id: int) -> Optional[bytes]:
+        """这条消息附的照片（JPEG 字节）；没有就是 None。"""
+        import base64 as _b64
+
+        r = self._exec("SELECT image FROM messages WHERE id=?", (int(msg_id),)).fetchone()
+        if not r or not r[0]:
+            return None
+        try:
+            return _b64.b64decode(r[0])
+        except (ValueError, TypeError):
+            return None
 
     def update_content(self, msg_id: int, content) -> None:
         self._exec("UPDATE messages SET content=? WHERE id=?", (content, msg_id))
@@ -180,12 +206,12 @@ class ChatDB:
 
     def recent(self, device, model, limit: int) -> List[dict]:
         rows = self._exec(
-            "SELECT id, role, content, tool_calls, tool_call_id, created FROM messages "
+            "SELECT id, role, content, tool_calls, tool_call_id, created, image IS NOT NULL FROM messages "
             "WHERE device=? AND model=? ORDER BY id DESC LIMIT ?", (device, model, int(limit))).fetchall()
         return [_row(r) for r in reversed(rows)]
 
     def after(self, device, model, after_id: int, limit: int = None) -> List[dict]:
-        sql = ("SELECT id, role, content, tool_calls, tool_call_id, created FROM messages "
+        sql = ("SELECT id, role, content, tool_calls, tool_call_id, created, image IS NOT NULL FROM messages "
                "WHERE device=? AND model=? AND id>? ORDER BY id")
         args = [device, model, int(after_id)]
         if limit:
@@ -258,8 +284,11 @@ class ChatDB:
 
 
 def _row(r) -> dict:
-    return {"id": r[0], "role": r[1], "content": r[2], "tool_calls": json.loads(r[3]) if r[3] else None,
-            "tool_call_id": r[4], "created": r[5]}
+    row = {"id": r[0], "role": r[1], "content": r[2], "tool_calls": json.loads(r[3]) if r[3] else None,
+           "tool_call_id": r[4], "created": r[5]}
+    if len(r) > 6:
+        row["has_image"] = bool(r[6])
+    return row
 
 
 def db() -> ChatDB:
@@ -380,7 +409,14 @@ def sync(conn, dialogue=None) -> None:
                     continue
                 msg_id = getattr(m, "db_id", None)
                 if msg_id is None:
-                    m.db_id = store.insert(device, name, m.role, m.content, m.tool_calls, m.tool_call_id)
+                    image = None
+                    pending = getattr(conn, "pending_photo", None)
+                    if pending and m.role == "user" and isinstance(m.content, str) \
+                            and m.content.startswith(PHOTO_MARK):
+                        image = pending
+                        conn.pending_photo = None
+                    m.db_id = store.insert(device, name, m.role, m.content, m.tool_calls, m.tool_call_id,
+                                           image=image)
                     m.db_content = m.content
                     dialogue.chat_ids.add(m.db_id)
                 elif m.content != getattr(m, "db_content", None):
@@ -567,10 +603,31 @@ def _display_text(content) -> str:
         try:
             data = json.loads(text)
             if isinstance(data, dict) and "content" in data:
-                return str(data["content"])
+                text = str(data["content"])
         except ValueError:
             pass
+    if PHOTO_MARK in text:
+        # 问照片的那句：库里带着视觉模型的描述（给出模型看的），屏上只显示用户问的话
+        cut = text.find("\n\n（照片内容：")
+        if cut < 0:
+            cut = text.find("\n\n（用户刚拍了一张照片")
+        if cut > 0:
+            text = text[:cut]
     return text
+
+
+def image_for(device: str, msg_id: int) -> Optional[bytes]:
+    """给屏幕取一张照片：只返回这台设备自己的那条记录的。"""
+    store = db()
+    r = store._exec("SELECT device, image FROM messages WHERE id=?", (int(msg_id),)).fetchone()
+    if not r or r[0] != device or not r[1]:
+        return None
+    import base64 as _b64
+
+    try:
+        return _b64.b64decode(r[1])
+    except (ValueError, TypeError):
+        return None
 
 
 def history(device: str, limit: int, models: List[str] = None) -> Dict[str, list]:
@@ -594,7 +651,7 @@ def history(device: str, limit: int, models: List[str] = None) -> Dict[str, list
                 if interrupted and text != CUT_MARK:
                     text = text[:-len(CUT_MARK)]
             items.append({"id": r["id"], "role": "user" if r["role"] == "user" else "bot", "text": text,
-                          "time": r["created"], "interrupted": interrupted})
+                          "time": r["created"], "interrupted": interrupted, "has_image": r.get("has_image", False)})
         if items:
             out[name] = items[-limit:]
     return out

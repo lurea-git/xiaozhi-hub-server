@@ -26,6 +26,10 @@ def render_fewshot(messages) -> str:
     return "<tool_call_examples>\n" + FEWSHOT_INTRO + "\n" + "\n".join(lines) + "\n</tool_call_examples>"
 
 
+# 拍照提问：用户消息以它开头，后面附一张照片（photo_box 写、chat_history 存）
+PHOTO_MARK = "📷 "
+
+
 class Message:
     def __init__(
             self,

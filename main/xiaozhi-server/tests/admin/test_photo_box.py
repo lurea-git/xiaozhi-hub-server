@@ -55,68 +55,55 @@ def test_photos_are_per_device_and_clearable():
     assert photo_box.peek("b") is not None
 
 
-def test_split_sentences():
-    assert photo_box.split_sentences("这是一杯咖啡。杯子是白色的！还有勺子") == ["这是一杯咖啡。", "杯子是白色的！", "还有勺子"]
-    assert photo_box.split_sentences("") == []
+def make_conn(vllm, turn_gen=1):
+    from types import SimpleNamespace
+    asked = []
+
+    conn = SimpleNamespace(turn_gen=turn_gen, pending_photo=None, asked=asked, photo_at_chat=None)
+
+    def chat(query, turn=None):
+        asked.append(query)
+        conn.photo_at_chat = conn.pending_photo   # 写进对话的那一刻照片还在
+
+    conn.chat = chat
+    return conn
 
 
-class FakeTTSQueue:
-    def __init__(self):
-        self.items = []
-
-    def put(self, item):
-        self.items.append(item)
-
-
-def make_conn():
-    queue = FakeTTSQueue()
-    log = SimpleNamespace(bind=lambda **kw: SimpleNamespace(info=lambda *a: None, error=lambda *a: None,
-                                                            warning=lambda *a: None))
-    conn = SimpleNamespace(
-        tts=SimpleNamespace(tts_text_queue=queue), dialogue=SimpleNamespace(put=lambda m: conn.said.append(m)),
-        said=[], replies=[], sentence_id=None, logger=log, turn_gen=1)
-    conn._put_reply = lambda sid, text: conn.replies.append(text)
-    return conn, queue
-
-
-def run_ask(monkeypatch, vllm):
-    from core.agent import chat_history
-    from core.utils import reply_progress
-
-    monkeypatch.setattr(chat_history, "sync", lambda conn: None)
-    monkeypatch.setattr(chat_history, "maybe_summarize", lambda conn: None)
-    monkeypatch.setattr(reply_progress, "note_turn", lambda *a: None)
-    monkeypatch.setattr(reply_progress, "finish_turn", lambda *a: None)
-    conn, queue = make_conn()
-    photo = photo_box.Photo(JPEG, vllm, "智谱", time.monotonic())
-    photo_box.ask(conn, "帮我解这道题", photo, 1)
-    return conn, queue
-
-
-def test_ask_speaks_answer_and_records_dialogue(monkeypatch):
+def test_ask_has_the_vision_model_describe_then_the_chat_model_answers(monkeypatch):
+    """视觉模型只当眼睛：它收到的是描述提示词，问题交给对话模型。"""
     seen = {}
 
     class Vllm:
         def response(self, question, b64):
-            seen["question"], seen["b64"] = question, b64
-            return "答案是四。因为二加二等于四。"
+            seen['prompt'] = question
+            return '桌上有一张纸，上面写着 3+4=8。'
 
-    conn, queue = run_ask(monkeypatch, Vllm())
-    assert seen["question"].startswith("帮我解这道题") and seen["b64"]
-    spoken = [i.content_detail for i in queue.items if i.content_detail]
-    assert spoken == ["答案是四。", "因为二加二等于四。"]
-    assert conn.said[0].content == photo_box.PHOTO_MARK + "帮我解这道题"
-    assert conn.replies == ["答案是四。因为二加二等于四。"]
+    conn = make_conn(Vllm())
+    photo_box.ask(conn, '这道题对不对', photo_box.Photo(JPEG, Vllm(), '智谱', time.monotonic()), 1)
+    assert seen['prompt'] == photo_box.DESCRIBE_PROMPT
+    assert conn.asked == ['📷 这道题对不对\n\n（照片内容：桌上有一张纸，上面写着 3+4=8。）']
+    assert conn.photo_at_chat and conn.pending_photo is None   # 照片随这条提问存进记录，之后清掉
 
 
-def test_ask_failure_gives_short_reply(monkeypatch):
+def test_ask_still_asks_the_question_when_the_vision_model_fails():
     class Broken:
         def response(self, question, b64):
-            raise RuntimeError("401")
+            raise RuntimeError('429 余额不足')
 
-    conn, queue = run_ask(monkeypatch, Broken())
-    assert [i.content_detail for i in queue.items if i.content_detail] == [photo_box.FAILED_REPLY]
-    assert conn.replies == [photo_box.FAILED_REPLY]
+    conn = make_conn(Broken())
+    photo_box.ask(conn, '这是什么', photo_box.Photo(JPEG, Broken(), '智谱', time.monotonic()), 1)
+    assert conn.asked == ['📷 这是什么\n\n（用户刚拍了一张照片，但没能识别出内容）']
+
+
+def test_ask_drops_the_question_if_interrupted_while_describing():
+    class Slow:
+        def response(self, question, b64):
+            conn.turn_gen += 1     # 用户打断，开了一轮新的
+            return '描述'
+
+    conn = make_conn(None)
+    photo_box.ask(conn, '这是什么', photo_box.Photo(JPEG, Slow(), '智谱', time.monotonic()), 1)
+    assert conn.asked == []
 
 
 async def test_kiosk_photo_endpoint(client, monkeypatch):
