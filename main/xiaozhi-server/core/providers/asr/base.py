@@ -278,8 +278,10 @@ class ASRProviderBase(ABC):
 
             # [xiaozhi-hub] 回复期间识别出的是回复自己的回声（开着回声消除时麦克风不关）就丢掉
             if text_len > 0 and reply_echo.during_reply(conn):
+                after = reply_echo.seconds_after_reply(conn)  # [thinksmart] 调 AFTER_END_USER 时对照
                 logger.bind(tag=TAG).info(
-                    f"回复期间识别: {content_for_length_check} | 峰值 {reply_echo.level_db(pcm_data):.1f} dBFS")
+                    f"回复期间识别: {content_for_length_check} | 峰值 {reply_echo.level_db(pcm_data):.1f} dBFS"
+                    f" | {'回复还在播' if after is None else f'回复播完 {after:.1f} 秒后说完'}")
                 if reply_echo.is_echo(conn, content_for_length_check):
                     logger.bind(tag=TAG).info(f"忽略回声识别: {content_for_length_check}")
                     text_len = 0
