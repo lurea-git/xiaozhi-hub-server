@@ -48,6 +48,11 @@ _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="admin")
 TEST_TIMEOUT = {"connect": 10.0, "read": 60.0, "write": 5.0, "pool": 2.0}
 logger = setup_logging()
 COOKIE_NAME = "xz_admin"
+# [thinksmart] 登录限流：同一来源 10 分钟内错 5 次就暂停；验证同一时间只做一个（scrypt 每次约 16 MB 内存、
+# 板子上几十毫秒 CPU，并发猜密码会占满线程池，拖慢唤醒词复核）；密码长度设上限
+LOGIN_MAX_FAILS = 5
+LOGIN_FAIL_WINDOW = 600
+MAX_PASSWORD_CHARS = 128
 STATIC_DIR = Path(__file__).parent / "static"
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -89,6 +94,8 @@ class AdminHandler:
         self._voice_samples = {}  # 音色 -> mp3 字节（试听缓存）
         self.logger = logger
         self.grokbot = GrokBotAdmin(grokbot_credentials, logger=logger.bind(tag=TAG))
+        self._login_lock = asyncio.Lock()   # [thinksmart] 设密码、验证密码同一时间只做一个
+        self._login_fails = {}               # [thinksmart] 来源地址 -> 最近失败的时间（monotonic）
 
     def register(self, app: web.Application) -> None:
         app.add_routes(
@@ -225,20 +232,53 @@ class AdminHandler:
         password = str(body.get("password") or "")
         if len(password) < auth.MIN_PASSWORD_LENGTH:
             return self._error(f"密码至少 {auth.MIN_PASSWORD_LENGTH} 位", 400)
-        password_hash = await self._blocking(auth.hash_password, password)
-        await self._blocking(config_store.set_password_hash, password_hash, self.config_path)
+        if len(password) > MAX_PASSWORD_CHARS:
+            return self._error(f"密码最多 {MAX_PASSWORD_CHARS} 位", 400)
+        async with self._login_lock:
+            # [thinksmart] 锁里再查一次：两个人同时首次设置，只有先到的那个生效
+            if await self._blocking(config_store.get_password_hash, self.config_path):
+                return self._error("密码已设置，请直接登录", 409)
+            password_hash = await self._blocking(auth.hash_password, password)
+            await self._blocking(config_store.set_password_hash, password_hash, self.config_path)
         self.logger.bind(tag=TAG).info("管理后台密码已设置")
         return self._login_response(request, {"ok": True})
 
+    def _recent_fails(self, who: str) -> list:
+        now = time.monotonic()
+        fails = [t for t in self._login_fails.get(who, ()) if now - t < LOGIN_FAIL_WINDOW]
+        if fails:
+            self._login_fails[who] = fails
+        else:
+            self._login_fails.pop(who, None)
+        return fails
+
+    def _note_fail(self, who: str) -> None:
+        if len(self._login_fails) > 256 and who not in self._login_fails:   # 来源太多：先清掉过期的
+            for k in list(self._login_fails):
+                self._recent_fails(k)
+        self._login_fails.setdefault(who, []).append(time.monotonic())
+
     async def handle_login(self, request: web.Request):
         body = await self._read_json(request)
-        stored = await self._blocking(config_store.get_password_hash, self.config_path)
-        if not stored:
-            return self._error("尚未设置密码", 409)
-        if not await self._blocking(auth.verify_password, str(body.get("password") or ""), stored):
-            await asyncio.sleep(1)  # 减缓暴力尝试
-            self.logger.bind(tag=TAG).warning(f"管理后台登录失败，来源 {request.remote}")
-            return self._error("密码错误", 401)
+        password = str(body.get("password") or "")
+        who = request.remote or "?"
+        fails = self._recent_fails(who)
+        if len(fails) >= LOGIN_MAX_FAILS:
+            minutes = int(LOGIN_FAIL_WINDOW - (time.monotonic() - fails[0])) // 60 + 1
+            return self._error(f"密码错误次数太多，请 {minutes} 分钟后再试", 429)
+        if self._login_lock.locked():
+            return self._error("正在验证另一次登录，请稍后再试", 429)
+        async with self._login_lock:
+            stored = await self._blocking(config_store.get_password_hash, self.config_path)
+            if not stored:
+                return self._error("尚未设置密码", 409)
+            ok = len(password) <= MAX_PASSWORD_CHARS and await self._blocking(auth.verify_password, password, stored)
+            if not ok:
+                self._note_fail(who)
+                await asyncio.sleep(1)  # 减缓暴力尝试（在锁里：全局每秒最多验证一次）
+                self.logger.bind(tag=TAG).warning(f"管理后台登录失败，来源 {who}")
+                return self._error("密码错误", 401)
+        self._login_fails.pop(who, None)
         return self._login_response(request, {"ok": True})
 
     async def handle_logout(self, request: web.Request):
