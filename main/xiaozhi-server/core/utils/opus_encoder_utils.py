@@ -31,7 +31,9 @@ class OpusEncoderUtils:
         self.total_frame_size = self.frame_size * channels
 
         # 比特率和复杂度设置
-        self.bitrate = 24000  # bps
+        # [thinksmart] 24k -> 64k：回复的语音更清楚。网关和客户端多在同一台机器或同一个局域网，
+        # 64 kbps（每 60 ms 一包约 480 字节）不占什么带宽。借鉴自 fubin0478/thinksmart-view。
+        self.bitrate = 64000  # bps
         self.complexity = 10  # 最高质量
 
         # 缓冲区初始化为空

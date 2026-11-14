@@ -17,6 +17,9 @@ from core.utils import p3, mp3_decode
 from pydub import AudioSegment
 from typing import Callable, Any
 
+# [thinksmart] 文件转 Opus（提示音、缓存的语音）也用 64 kbps，和 OpusEncoderUtils 一致（原来是编码器默认值）
+OPUS_BITRATE = 64000
+
 TAG = __name__
 
 
@@ -338,6 +341,7 @@ async def audio_to_data(
 
         # 初始化Opus编码器
         encoder = opuslib_next.Encoder(16000, 1, opuslib_next.APPLICATION_AUDIO)
+        encoder.bitrate = OPUS_BITRATE  # [thinksmart]
 
         # 编码参数
         frame_duration = 60  # 60ms per frame
@@ -419,6 +423,7 @@ def pcm_to_data_stream(raw_data, is_opus=True, callback: Callable[[Any], Any] = 
     using_temp_encoder = False
     if is_opus and opus_encoder is None:
         encoder = opuslib_next.Encoder(sample_rate, 1, opuslib_next.APPLICATION_AUDIO)
+        encoder.bitrate = OPUS_BITRATE  # [thinksmart]
         using_temp_encoder = True
 
     # 编码参数
