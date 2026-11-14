@@ -1,5 +1,8 @@
 import asyncio
+import ipaddress
 import logging
+import socket
+from urllib.parse import urlsplit
 
 import websockets
 from config.logger import setup_logging
@@ -38,6 +41,36 @@ from core.utils.modules_initialize import initialize_modules
 from core.utils.util import check_vad_update, check_asr_update
 
 TAG = __name__
+
+
+def _local_host(host: str) -> bool:
+    """设备自己的地址：IP、localhost、*.local、本机主机名。"""
+    host = host.lower().rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return host == "localhost" or host.endswith(".local") or host == socket.gethostname().lower()
+
+
+def cross_site_origin(headers):
+    """[thinksmart] 要拒绝的 Origin；None 表示放行。
+
+    设备（ESP32、本机客户端）不带 Origin，照常放行。浏览器一定带 Origin：只放行和所连地址同一个主机的
+    页面（比如网关自己端口上的测试页），别的网站一律拒绝，免得用户打开一个网页，那个网页就在后台连上
+    网关、用掉模型额度。Host 还必须是设备自己的地址，挡住 DNS 重绑定（恶意域名解析到设备 IP 时，
+    Origin 和 Host 都是那个域名）。
+    """
+    origin = headers.get("Origin") or headers.get("origin")
+    if not origin:
+        return None
+    host = headers.get("Host") or headers.get("host") or ""
+    o = urlsplit(origin).hostname
+    h = urlsplit("//" + host).hostname
+    if o and h and o == h and _local_host(h):
+        return None
+    return origin
 
 
 class WebSocketServer:
@@ -154,6 +187,11 @@ class WebSocketServer:
     async def _http_response(self, websocket, request_headers):
         # 检查是否为 WebSocket 升级请求
         if request_headers.headers.get("connection", "").lower() == "upgrade":
+            # [thinksmart] 浏览器里别的网站发起的连接（跨站 WebSocket 劫持）直接拒绝
+            refused = cross_site_origin(request_headers.headers)
+            if refused is not None:
+                self.logger.bind(tag=TAG).warning(f"拒绝跨站 WebSocket 连接：Origin {refused}")
+                return websocket.respond(403, "Forbidden\n")
             # 如果是 WebSocket 请求，返回 None 允许握手继续
             return None
         else:
