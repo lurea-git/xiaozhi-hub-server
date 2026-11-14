@@ -28,15 +28,12 @@ class VisionHandler(BaseHandler):
         return {"success": False, "message": message}
 
     def _verify_auth_token(self, request) -> Tuple[bool, Optional[str]]:
-        """验证认证token"""
-        # 测试模式：允许特定测试令牌或跳过验证
-        auth_header = request.headers.get("Authorization", "")
-        client_id = request.headers.get("Client-Id", "")
+        """验证认证token
 
-        # 允许测试客户端跳过认证
-        if client_id == "web_test_client":
-            device_id = request.headers.get("Device-Id", "test_device")
-            return True, device_id
+        [thinksmart] 去掉了原来的测试后门：请求头带 Client-Id: web_test_client 就跳过认证。
+        网关监听 0.0.0.0，局域网里任何人加上这个头就能免费调用视觉模型（花的是这台设备的 API Key）。
+        """
+        auth_header = request.headers.get("Authorization", "")
 
         if not auth_header.startswith("Bearer "):
             return False, None
